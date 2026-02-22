@@ -121,17 +121,21 @@ TOOLS = [
 ]
 
 SYSTEM_PROMPT = (
-    "You are a helpful assistant for a Universal Data Connector system. "
-    "You have access to four data sources: students, CRM, support tickets, and analytics. "
-    "Based on the user's question, choose the most appropriate data source tool: "
-    "- Use `get_student_data` for questions about students, courses, marks, batches, terms, grades. "
-    "- Use `get_crm_data` for questions about customers, CRM, sales, companies, revenue. "
-    "- Use `get_support_data` for questions about support tickets, issues, complaints, priorities. "
-    "- Use `get_analytics_data` for questions about analytics, metrics, page views, sessions, conversions. "
-    "Always try to use the most relevant tool. If the request is ambiguous, pick the best match. "
-    "Do not refuse to fetch data; always attempt to use a tool. "
-    "If the user is in voice mode (provided in the request context), be extremely concise and conversational. "
-    "Avoid long tables or lists; instead, summarize the key highlights verbally."
+    "You are a helpful and conversational assistant for a Universal Data Connector. "
+    "You have access to tools for fetching data from: students, CRM, support tickets, and analytics. "
+    "TOOL USE RULES: "
+    "1. ONLY use a tool if the user explicitly asks for information related to those datasets. "
+    "2. If the user is just greeting you (e.g., 'Hello', 'Hi'), checking if you are there, or asking if they are audible (e.g., 'Am I audible?', 'Can you hear me?'), DO NOT use any tools. Just respond naturally and conversationally. "
+    "3. Do NOT make up information or fetch data if the query is unrelated to your four data sources. "
+    "VOICE MODE PERSONA: "
+    "If `voice_mode` is enabled, speak naturally like a human colleague. "
+    "- Do NOT use technical jargon like 'records', 'database', or 'limit'. "
+    "- Use warm transitions: 'Sure, let me check that for you...', 'I found the details in the CRM'. "
+    "- Be concise and summarized. Avoid robotic lists. "
+    "LANGUAGE MATCHING (STRICT): "
+    "Always respond in the same language the user is using. "
+    "Default to English, but switch to Hindi immediately if the user speaks Hindi. "
+    "Switch back to English as soon as the user speaks English again."
 )
 
 # In-memory session storage (OpenAI message format)
@@ -251,35 +255,35 @@ def chat_with_data(request: ChatRequest):
 
         error_str = str(e)
         if '429' in error_str or 'rate' in error_str.lower():
-            reason = "API rate limit reached. Please wait a moment and retry."
+            reason = f"API rate limit reached ({error_str})"
         elif '503' in error_str or 'unavailable' in error_str.lower():
-            reason = "AI service temporarily unavailable."
+            reason = f"AI service temporarily unavailable ({error_str})"
         elif '504' in error_str or 'timeout' in error_str.lower():
-            reason = "AI service timed out."
+            reason = f"AI service timed out ({error_str})"
         elif 'auth' in error_str.lower() or '401' in error_str or '403' in error_str:
-            reason = "API key issue — please check your GROQ_API_KEY."
+            reason = f"API key issue ({error_str})"
         else:
-            reason = "AI service error."
+            reason = f"AI service error: {error_str}"
 
         if is_crm:
             connector = CRMConnector()
             data = connector.fetch(limit=limit)
             return {
-                "response": f"I'm running in offline mode ({reason}). Here are {len(data)} CRM customer records.",
+                "response": f"I've checked the customer list for you. {reason if 'error' in reason else ''} Here are the details for {len(data)} customers.",
                 "data": data
             }
         elif is_support:
             connector = SupportConnector()
             data = connector.fetch(limit=limit)
             return {
-                "response": f"I'm running in offline mode ({reason}). Here are {len(data)} support tickets.",
+                "response": f"I've looked through the support tickets. {reason if 'error' in reason else ''} I found {len(data)} tickets that might interest you.",
                 "data": data
             }
         elif is_analytics:
             connector = AnalyticsConnector()
             data = connector.fetch(limit=limit)
             return {
-                "response": f"I'm running in offline mode ({reason}). Here are {len(data)} analytics records.",
+                "response": f"I've pulled the analytics metrics you asked for. {reason if 'error' in reason else ''} Here is the summary of the latest {len(data)} data points.",
                 "data": data
             }
         else:
@@ -313,6 +317,6 @@ def chat_with_data(request: ChatRequest):
                 data = [d for d in data if d.get('grade', '').upper() == target_grade]
 
             return {
-                "response": f"I'm running in offline mode ({reason}). I found {len(data)} student results based on your keywords.",
+                "response": f"I've found {len(data)} student courses matching your request. {reason if 'error' in reason else ''} Here is the information.",
                 "data": data
             }

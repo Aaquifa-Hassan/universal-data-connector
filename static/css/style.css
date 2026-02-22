@@ -616,3 +616,56 @@ footer {
         width: 100%;
     }
 }
+
+/* ── Debug Console ── */
+.debug-console {
+    margin-top: 1.5rem;
+    background: #000;
+    border: 1px solid var(--border);
+    border-radius: 0.5rem;
+    padding: 0.75rem;
+    font-family: 'Courier New', monospace;
+    font-size: 0.75rem;
+}
+
+.debug-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0.4rem;
+    margin-bottom: 0.4rem;
+}
+
+.debug-header button {
+    background: var(--border);
+    border: none;
+    color: var(--text);
+    padding: 2px 8px;
+    border-radius: 3px;
+    cursor: pointer;
+}
+
+.debug-logs {
+    max-height: 150px;
+    overflow-y: auto;
+    color: #0f0;
+}
+
+.debug-entry {
+    margin-bottom: 4px;
+    line-height: 1.2;
+}
+
+.debug-entry.error {
+    color: #f44;
+}
+
+.debug-entry.info {
+    color: #4af;
+}
+
+.debug-entry.success {
+    color: #4f4;
+}

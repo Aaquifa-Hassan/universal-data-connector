@@ -9,15 +9,27 @@ const textInput = document.getElementById('textInput');
 const submitButton = document.getElementById('submitButton');
 const stopButton = document.getElementById('stopButton');
 const chatHistory = document.getElementById('chatHistory');
+const debugConsole = document.getElementById('debugConsole');
+const debugLogs = document.getElementById('debugLogs');
+
+function logDebug(msg, type = 'info') {
+    if (!debugLogs) return;
+    const entry = document.createElement('div');
+    entry.className = `debug-entry ${type}`;
+    entry.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    debugLogs.appendChild(entry);
+    debugLogs.scrollTop = debugLogs.scrollHeight;
+    console.log(`[DEBUG] ${msg}`);
+}
+
+window.clearDebug = () => { if (debugLogs) debugLogs.innerHTML = ''; };
 
 let currentChatController = null;
 
 // Session Management
-let sessionId = localStorage.getItem('chat_session_id');
-if (!sessionId) {
-    sessionId = crypto.randomUUID();
-    localStorage.setItem('chat_session_id', sessionId);
-}
+// Session Management - Always generate a new session ID for a fresh start on every refresh
+let sessionId = crypto.randomUUID();
+logDebug(`New Session Initialized: ${sessionId}`, "success");
 
 // Speech Recognition Setup
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -35,26 +47,62 @@ if (SpeechRecognition) {
 
     recognition.onstart = () => {
         isListening = true;
-        micButton.classList.add('listening');
-        if (isCallActive && !isAISpeaking) {
-            status.textContent = 'Call Active: Listening... Speak now!';
+        logDebug("Recognition Started", "success");
+        if (!isCallActive) {
+            micButton.classList.add('listening');
+        }
+        if (isCallActive) {
+            if (isAISpeaking) {
+                status.textContent = 'Call Active: AI Responding... (speak to interrupt)';
+            } else {
+                status.textContent = 'Call Active: Listening... Speak now!';
+            }
         } else if (!isCallActive) {
             status.textContent = 'Listening... Speak now!';
         }
     };
 
+    recognition.onsoundstart = () => {
+        logDebug("Sound Start Detected");
+        // Most sensitive immediate Barge-in: fires as soon as ANY sound starts.
+        if (isCallActive && isAISpeaking) {
+            logDebug("Barge-in: Interruption triggered (Sound Start)", "success");
+            interruptAI();
+        }
+    };
+
+    recognition.onspeechstart = () => {
+        logDebug("Speech Start Detected");
+        // Fires when speech specifically is detected.
+        if (isCallActive && isAISpeaking) {
+            logDebug("Barge-in: Interruption triggered (Speech Start)", "success");
+            interruptAI();
+        }
+    };
+
+    function interruptAI() {
+        if (!isAISpeaking) return;
+
+        console.log("Interrupting AI synthesis...");
+        window.speechSynthesis.cancel();
+        isAISpeaking = false;
+        micButton.classList.remove('speaking');
+        micButton.classList.add('call-active');
+        status.textContent = 'Call Active: Interrupted. Listening...';
+
+        if (currentChatController) {
+            currentChatController.abort();
+            currentChatController = null;
+            const thinkingBubble = chatHistory.querySelector('.chat-bubble.thinking');
+            if (thinkingBubble) thinkingBubble.remove();
+        }
+    }
+
     recognition.onresult = (event) => {
-        // Barge-in: If the AI is speaking and we detect user audio, stop the AI unconditionally.
+        // Fallback Barge-in: If onsoundstart didn't catch it, the interim result certainly will.
         if (isAISpeaking) {
-            window.speechSynthesis.cancel();
-            isAISpeaking = false;
-            // Cancel the current fetch request to the AI if it's still thinking
-            if (currentChatController) {
-                currentChatController.abort();
-                currentChatController = null;
-                const thinkingBubble = chatHistory.querySelector('.chat-bubble.thinking');
-                if (thinkingBubble) thinkingBubble.remove();
-            }
+            console.log("Barge-in detected via onresult");
+            interruptAI();
         }
 
         let interimTranscript = '';
@@ -83,18 +131,31 @@ if (SpeechRecognition) {
                 if (textInput.value.trim() !== '') {
                     const query = textInput.value;
                     textInput.value = ''; // clear immediately
-                    handleQuery(query);
+                    handleQuery(query, true); // explicitly mark as voice
                 }
             }, SILENCE_TIMEOUT);
         }
     };
 
     recognition.onerror = (event) => {
-        console.error('Speech recognition error:', event.error);
+        logDebug(`Recognition Error: ${event.error}`, "error");
+
+        if (isCallActive) {
+            // In Call Mode, most errors (no-speech, network, etc.) should NOT kill the call.
+            // We just let onend restart it.
+            if (event.error === 'no-speech') {
+                status.textContent = 'Call Active: Listening...';
+            } else {
+                status.textContent = `Call Active: Note - ${event.error}`;
+            }
+            return;
+        }
+
         if (event.error !== 'aborted') {
             status.textContent = `Error: ${event.error}. Try again.`;
             micButton.classList.remove('listening');
             micButton.classList.remove('call-active');
+            micButton.classList.remove('speaking');
             isListening = false;
             isCallActive = false;
         }
@@ -102,22 +163,38 @@ if (SpeechRecognition) {
 
     recognition.onend = () => {
         isListening = false;
-        // In call mode, try to restart recognition immediately if not deliberately stopped
-        // and if AI is not currently speaking (we'll start it after AI finishes)
-        if (isCallActive && !isAISpeaking) {
-            try {
-                recognition.start();
-            } catch (e) {
-                // Ignore error if already started
-            }
-        } else if (!isCallActive) {
+        logDebug(`Recognition Ended (isCallActive: ${isCallActive})`, isCallActive ? 'info' : 'success');
+
+        // In call mode, we ALWAYS want the mic listening, even if the AI is speaking.
+        // If it stops for any reason (noise, timeout, etc.), we restart it with a small delay.
+        if (isCallActive) {
+            setTimeout(() => {
+                if (isCallActive && !isListening) {
+                    try {
+                        recognition.start();
+                        logDebug("Recognition Restarted", "info");
+                    } catch (e) {
+                        // Already started
+                    }
+                }
+            }, 100); // 100ms delay to prevent browser throttling
+        } else {
             micButton.classList.remove('listening');
             micButton.classList.remove('call-active');
+            micButton.classList.remove('speaking');
             if (status.textContent.includes('Listening')) {
                 status.textContent = 'Ready to listen...';
             }
         }
     };
+
+    // Watchdog: Every 5 seconds, ensure mic is actually on if Call Active
+    setInterval(() => {
+        if (isCallActive && !isListening) {
+            logDebug("Watchdog: Restarting mic...", "info");
+            try { recognition.start(); } catch (e) { }
+        }
+    }, 5000);
 } else {
     status.textContent = 'Speech recognition not supported. Use Chrome or Edge.';
     micButton.disabled = true;
@@ -132,6 +209,9 @@ micButton.addEventListener('click', () => {
 
     if (isCallActive) {
         micButton.classList.add('call-active');
+        micButton.classList.remove('listening');
+        debugConsole.classList.remove('hidden'); // Show logs when call active
+        logDebug("Call Mode Started", "success");
         status.textContent = 'Call Mode Started. Listening...';
         try {
             recognition.start();
@@ -171,7 +251,7 @@ stopButton.addEventListener('click', () => {
 });
 
 // ── Handle Query ──
-async function handleQuery(query) {
+async function handleQuery(query, isVoice = false) {
     // Clear placeholder if first message
     const placeholder = chatHistory.querySelector('.chat-placeholder');
     if (placeholder) placeholder.remove();
@@ -179,7 +259,13 @@ async function handleQuery(query) {
     // Add user bubble
     addChatBubble(query, 'user');
     textInput.value = '';
-    status.textContent = 'Asking the AI...';
+
+    // Smooth conversational status
+    if (isCallActive || isVoice) {
+        status.textContent = 'Checking on that for you...';
+    } else {
+        status.textContent = 'Asking the AI...';
+    }
 
     // Add thinking indicator
     const thinkingBubble = addThinkingBubble();
@@ -195,7 +281,7 @@ async function handleQuery(query) {
     stopButton.classList.remove('hidden');
 
     try {
-        const result = await chatWithAI(query, currentChatController.signal);
+        const result = await chatWithAI(query, currentChatController.signal, isVoice || isCallActive);
 
         // Remove thinking indicator
         thinkingBubble.remove();
@@ -240,7 +326,7 @@ async function handleQuery(query) {
 }
 
 // ── Chat with AI Backend ──
-async function chatWithAI(message, signal) {
+async function chatWithAI(message, signal, isVoice = false) {
     const url = `${API_BASE}/chat/`;
     // If no signal provided, create a default one with timeout
     let internalController = null;
@@ -254,8 +340,6 @@ async function chatWithAI(message, signal) {
     // We still want a safety timeout of 25s even with manual stop
     const timeoutId = setTimeout(() => {
         if (internalController) internalController.abort();
-        // If external signal, we can't abort it directly here easily without wrappers, 
-        // but the manual stop is the main goal.
     }, 25000);
 
     try {
@@ -267,7 +351,8 @@ async function chatWithAI(message, signal) {
             },
             body: JSON.stringify({
                 message: message,
-                session_id: sessionId
+                session_id: sessionId,
+                voice_mode: isVoice
             }),
             signal: fetchSignal
         });
@@ -319,7 +404,7 @@ function addAIBubble(result, retryQuery) {
     bubble.className = 'chat-bubble ai';
 
     // Label + speak button + copy
-    let html = `<div class="ai-label">AI Assistant <button class="speak-inline" onclick="speak(this.closest('.chat-bubble').querySelector('.ai-text').textContent)">🔊</button><button class="copy-inline" title="Copy response">📋</button></div>`;
+    let html = `<div class="ai-label">Universal Data Connector <button class="speak-inline" onclick="speak(this.closest('.chat-bubble').querySelector('.ai-text').textContent)">🔊</button><button class="copy-inline" title="Copy response">📋</button></div>`;
 
     // AI text
     const responseText = result.response || 'Here are the results.';
@@ -374,7 +459,7 @@ function addErrorBubble(errorMsg, retryQuery) {
     const bubble = document.createElement('div');
     bubble.className = 'chat-bubble ai';
     bubble.innerHTML = `
-        <div class="ai-label">AI Assistant <button class="copy-inline" title="Copy response">📋</button><button class="retry-inline" title="Retry this question">🔄</button></div>
+        <div class="ai-label">Universal Data Connector <button class="copy-inline" title="Copy response">📋</button><button class="retry-inline" title="Retry this question">🔄</button></div>
         <div class="ai-text error-text">${errorMsg}</div>`;
     chatHistory.appendChild(bubble);
     scrollToBottom();
@@ -394,12 +479,16 @@ async function retryMessage(query) {
     status.textContent = 'Retrying...';
 
     try {
-        const result = await chatWithAI(query);
+        const result = await chatWithAI(query, null, isCallActive);
         thinkingBubble.remove();
         const isOffline = result.response && result.response.includes('offline mode');
         addAIBubble(result, isOffline ? query : null);
         if (result.response) speak(result.response);
-        status.textContent = 'Ready to listen...';
+        if (isCallActive) {
+            status.textContent = 'Call Active: Listening...';
+        } else {
+            status.textContent = 'Ready to listen...';
+        }
     } catch (error) {
         console.error('Retry error:', error);
         thinkingBubble.remove();
@@ -433,16 +522,10 @@ function speak(text) {
         utterance.volume = 1;
 
         isAISpeaking = true;
-
-        // Pause recognition while speaking to prevent AI hearing itself
-        // But only if we are currently listening
-        if (isCallActive && isListening) {
-            recognition.stop();
-        }
+        logDebug("AI Started Speaking");
 
         if (isCallActive) {
             status.textContent = 'Call Active: AI Responding... (speak to interrupt)';
-            micButton.classList.remove('listening');
             micButton.classList.add('speaking');
         }
 
@@ -450,10 +533,7 @@ function speak(text) {
             isAISpeaking = false;
             if (isCallActive) {
                 micButton.classList.remove('speaking');
-                // Restart listening after speech ends
-                try {
-                    recognition.start();
-                } catch (e) { }
+                status.textContent = 'Call Active: Listening...';
             }
         };
 
@@ -462,9 +542,7 @@ function speak(text) {
             isAISpeaking = false;
             if (isCallActive) {
                 micButton.classList.remove('speaking');
-                try {
-                    recognition.start();
-                } catch (e) { }
+                status.textContent = 'Call Active: Listening...';
             }
         };
 
