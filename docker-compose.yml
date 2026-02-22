@@ -1,0 +1,18 @@
+services:
+  api:
+    build: .
+    container_name: universal-data-connector
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data # Persist data
+    env_file:
+      - .env.example # Use .env in production
+    environment:
+      - API_KEY=${API_KEY:-secret-api-key}
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped

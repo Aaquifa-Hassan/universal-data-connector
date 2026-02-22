@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Universal Data Connector - Voice Interface</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>🎤 Universal Data Connector</h1>
+            <p class="subtitle">Ask questions about student data using your voice</p>
+        </header>
+
+        <main>
+            <!-- Chat History (above input) -->
+            <div id="chatHistory" class="chat-history">
+                <div class="chat-placeholder">Start a conversation by asking a question below.</div>
+            </div>
+
+            <!-- Input Section -->
+            <div class="input-section">
+                <button id="micButton" class="mic-button-inline" aria-label="Start voice input">
+                    <svg class="mic-icon-small" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                        <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                        <line x1="12" y1="19" x2="12" y2="23"></line>
+                        <line x1="8" y1="23" x2="16" y2="23"></line>
+                    </svg>
+                </button>
+                <input type="text" id="textInput" placeholder="Type your question here..." />
+                <button id="submitButton" class="submit-button">Ask</button>
+                <button id="stopButton" class="stop-button hidden" title="Stop request"
+                    aria-label="Stop request">&#9632;</button>
+            </div>
+
+            <p id="status" class="status">Ready to listen...</p>
+        </main>
+
+        <!-- Stream Data Section -->
+        <section class="stream-section">
+            <button class="stream-toggle" onclick="toggleStreamPanel()">
+                ⚡ Stream Data <span class="toggle-arrow" id="streamArrow">▸</span>
+            </button>
+            <div id="streamPanel" class="stream-panel hidden">
+                <div class="stream-controls">
+                    <select id="streamSource">
+                        <option value="crm">CRM</option>
+                        <option value="support">Support</option>
+                        <option value="analytics">Analytics</option>
+                        <option value="students">Students</option>
+                    </select>
+                    <input type="number" id="streamLimit" value="10" min="1" max="100" title="Max records" />
+                    <input type="number" id="streamDelay" value="0.2" min="0" max="2" step="0.1" title="Delay (s)" />
+                    <button id="streamButton" onclick="startStream()">▶ Start</button>
+                    <button onclick="clearStreamOutput()" class="stream-clear">✕ Clear</button>
+                </div>
+                <div id="streamOutput" class="stream-output"></div>
+                <div id="streamStatus" class="stream-status"></div>
+            </div>
+        </section>
+
+        <footer>
+            <div class="examples">
+                <h3>Try asking:</h3>
+                <ul>
+                    <li>"Show me students in batch 22f2"</li>
+                    <li>"Show CRM customers from last month"</li>
+                    <li>"List open support tickets"</li>
+                    <li>"Give me analytics data"</li>
+                </ul>
+            </div>
+        </footer>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+
+</html>

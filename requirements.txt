@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+pydantic
+pytest
+requests
+sqlalchemy
+pandas
+pydantic-settings
+google-genai
+openai
+openpyxl
+slowapi
+httpx
+openai
