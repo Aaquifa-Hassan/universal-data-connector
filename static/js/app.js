@@ -328,16 +328,14 @@ async function handleQuery(query, isVoice = false) {
 // ── Chat with AI Backend ──
 async function chatWithAI(message, signal, isVoice = false) {
     const url = `${API_BASE}/chat/`;
-    // If no signal provided, create a default one with timeout
+
     let internalController = null;
     let fetchSignal = signal;
-
     if (!fetchSignal) {
         internalController = new AbortController();
         fetchSignal = internalController.signal;
     }
 
-    // We still want a safety timeout of 25s even with manual stop
     const timeoutId = setTimeout(() => {
         if (internalController) internalController.abort();
     }, 25000);
@@ -363,7 +361,40 @@ async function chatWithAI(message, signal, isVoice = false) {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
 
-        return await response.json();
+        // ── Read SSE stream line-by-line ──────────────────────────────────────
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let fullText = '';
+        let finalData = [];
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop(); // keep incomplete last line
+
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                const jsonStr = line.substring(6).trim();
+                if (!jsonStr) continue;
+
+                let parsed;
+                try { parsed = JSON.parse(jsonStr); } catch { continue; }
+
+                if (parsed.text) {
+                    fullText += parsed.text;
+                }
+                if (parsed.done) {
+                    finalData = parsed.data || [];
+                }
+            }
+        }
+
+        return { response: fullText.trim() || null, data: finalData };
+
     } catch (err) {
         clearTimeout(timeoutId);
         if (err.name === 'AbortError') {
@@ -372,6 +403,7 @@ async function chatWithAI(message, signal, isVoice = false) {
         throw err;
     }
 }
+
 
 // ── Add a simple chat bubble ──
 function addChatBubble(text, role) {

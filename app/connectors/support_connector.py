@@ -1,10 +1,20 @@
-import json
-from app.connectors.base import BaseConnector
-from typing import List, Dict, Any
-from app.utils.mock_data import generate_mock_support_data
+"""Support connector — thin sync wrapper around the mock Support API."""
 
-class SupportConnector(BaseConnector):
+import httpx
+from app.config import settings
 
-    def fetch(self, **kwargs) -> List[Dict[str, Any]]:
-        limit = int(kwargs.get("limit", 10))
-        return generate_mock_support_data(count=limit)
+
+class SupportConnector:
+    def fetch(self, limit: int = 10, status: str = None, priority: int = None):
+        base = settings.support_api_url.rstrip("/")
+        params = {"limit": limit}
+        if status:
+            params["status"] = status
+        if priority is not None:
+            params["priority"] = priority
+        try:
+            resp = httpx.get(f"{base}/tickets", params=params, timeout=10.0)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception:
+            return []

@@ -1,11 +1,15 @@
+"""CRM connector — thin sync wrapper around the mock CRM API."""
 
-import json
-from app.connectors.base import BaseConnector
-from typing import List, Dict, Any
-from app.utils.mock_data import generate_mock_crm_data
+import httpx
+from app.config import settings
 
-class CRMConnector(BaseConnector):
 
-    def fetch(self, **kwargs) -> List[Dict[str, Any]]:
-        limit = int(kwargs.get("limit", 10))
-        return generate_mock_crm_data(count=limit)
+class CRMConnector:
+    def fetch(self, limit: int = 10):
+        base = settings.crm_api_url.rstrip("/")
+        try:
+            resp = httpx.get(f"{base}/contacts", params={"limit": limit}, timeout=10.0)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception:
+            return []

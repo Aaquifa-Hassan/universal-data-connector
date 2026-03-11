@@ -14,9 +14,9 @@ class Settings(BaseSettings):
     GROQ_API_KEY: Optional[str] = None
     
     # Mock API URLs
-    crm_api_url: str = "http://mock-crm-api"
-    support_api_url: str = "http://mock-support-api"
-    analytics_api_url: str = "http://mock-analytics-api"
+    crm_api_url: str = "http://localhost:8001/crm"
+    support_api_url: str = "http://localhost:8001/support"
+    analytics_api_url: str = "http://localhost:8001/analytics"
 
     # Caching
     CACHE_TTL: int = 300  # seconds
