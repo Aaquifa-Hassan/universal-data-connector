@@ -6,8 +6,12 @@ Thread-safe cache with configurable TTL for caching connector data.
 import time
 import hashlib
 import json
+import redis
 import threading
-from typing import Any, Optional, Dict
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
+
+from app.config import settings
 
 
 class TTLCache:
@@ -85,6 +89,44 @@ class TTLCache:
             return [k for k, v in self._store.items() if now <= v["expires_at"]]
 
 
+class RedisCache:
+    """Persistent cache using Redis."""
+    def __init__(self, host: str, port: int, db: int, default_ttl: int = 300):
+        self.client = redis.Redis(host=host, port=port, db=db, decode_responses=True)
+        self.default_ttl = default_ttl
+
+    def get(self, key: str) -> Optional[Any]:
+        data = self.client.get(key)
+        if data:
+            return json.loads(data)
+        return None
+
+    def set(self, key: str, value: Any, ttl: Optional[int] = None):
+        ttl = ttl or self.default_ttl
+        self.client.setex(key, ttl, json.dumps(value, default=str))
+
+    def invalidate(self, key: str):
+        self.client.delete(key)
+
+    def invalidate_pattern(self, pattern: str):
+        """Invalidate all keys matching a glob pattern."""
+        keys = self.client.keys(pattern)
+        if keys:
+            self.client.delete(*keys)
+
+    def clear(self):
+        self.client.flushdb()
+
+    def get_stats(self) -> Dict[str, Any]:
+        info = self.client.info()
+        return {
+            "type": "redis",
+            "uptime_seconds": info.get("uptime_in_seconds"),
+            "connected_clients": info.get("connected_clients"),
+            "used_memory_human": info.get("used_memory_human"),
+        }
+
+
 def make_cache_key(source: str, **params) -> str:
     """Generate a deterministic cache key from source + params."""
     filtered = {k: v for k, v in sorted(params.items()) if v is not None}
@@ -93,4 +135,35 @@ def make_cache_key(source: str, **params) -> str:
 
 
 # Global cache instance
-data_cache = TTLCache(default_ttl=300)
+_data_cache = None
+
+def get_cache():
+    """Lazy initialization of the global cache to avoid circular imports."""
+    global _data_cache
+    if _data_cache is not None:
+        return _data_cache
+    
+    from app.config import settings
+    try:
+        cache = RedisCache(
+            host=settings.REDIS_HOST,
+            port=settings.REDIS_PORT,
+            db=settings.REDIS_DB,
+            default_ttl=settings.CACHE_TTL
+        )
+        # Test connection
+        cache.client.ping()
+        print("[CACHE] Redis persistent cache initialized.")
+        _data_cache = cache
+    except Exception as e:
+        print(f"[CACHE] Redis connection failed ({e}). Falling back to in-memory TTLCache.")
+        _data_cache = TTLCache(default_ttl=settings.CACHE_TTL)
+    
+    return _data_cache
+
+# For backward compatibility with existing imports
+class CacheProxy:
+    def __getattr__(self, name):
+        return getattr(get_cache(), name)
+
+data_cache = CacheProxy()

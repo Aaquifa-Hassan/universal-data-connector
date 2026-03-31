@@ -18,10 +18,13 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Dict, Any, Optional
+import asyncio
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from app.config import settings
-from app.connectors.unified_connector import UnifiedConnector, ConfigurationError
+from app.connectors.unified_connector import UnifiedConnector, ConfigurationError, unified_connector
+from app.services.metadata_service import metadata_service
+from app.services.cache import data_cache, make_cache_key
 
 # ── Router ─────────────────────────────────────────────────────────────────────
 
@@ -39,6 +42,12 @@ if not client:
 
 MODEL_NAME = "llama-3.1-8b-instant"
 
+# Word-to-number map — handles LLM passing 'one', 'two' etc. instead of digits
+_WORD_NUM = {
+    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "nine": "9", "zero": "0",
+}
+
 # ── Tool definitions (12 tools — one per UnifiedConnector method) ──────────────
 
 TOOLS = [
@@ -48,7 +57,7 @@ TOOLS = [
         "function": {
             "name": "authenticate_user",
             "description": (
-                "Verify a caller's identity using their customer ID. "
+                "Verify a caller's identity in our warehouse records using their customer ID. "
                 "ALWAYS call this first before accessing any customer data. "
                 "Call it as soon as the user provides their customer ID (e.g. they say 'one' → pass 'CUST-001')."
             ),
@@ -68,17 +77,26 @@ TOOLS = [
             }
         }
     },
-    # get_customer_orders and get_customer_profile removed for scope reduction
     {
         "type": "function",
         "function": {
-            "name": "check_expiry",
-            "description": (
-                "Fetch details for a specific order to check for product expiry. "
-                "Automatically determines if a product is expired and the recommended resolution. "
-                "CRITICAL: You must call this ONLY after the user provides an order ID. "
-                "NEVER invent or hallucinate an order ID."
-            ),
+            "name": "get_recent_orders",
+            "description": "Get a list of recent orders for an authenticated customer from our records. Use this if the customer doesn't have their order number ready.",
+            "parameters": {
+                "type": "object",
+                "required": ["customer_id"],
+                "properties": {
+                    "customer_id": {"type": "string"},
+                    "limit": {"type": "integer", "description": "Number of orders to return (default 5)."}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_order_details",
+            "description": "Fetch comprehensive details for an order, including products, shipping dates, status, and pricing.",
             "parameters": {
                 "type": "object",
                 "required": ["customer_id", "order_id"],
@@ -86,7 +104,7 @@ TOOLS = [
                     "customer_id": {"type": "string"},
                     "order_id": {
                         "type": "string",
-                        "description": "The Salesforce Order ID provided by the customer."
+                        "description": "The Order ID provided by the customer (e.g., ORD-1)."
                     }
                 }
             }
@@ -142,11 +160,48 @@ TOOLS = [
             ),
             "parameters": {
                 "type": "object",
-                "required": ["ticket_id"],
                 "properties": {
-                    "ticket_id":   {"type": "string"},
+                    "ticket_id": {"type": "string", "description": "The support ticket ID (e.g., TICK-1001)"},
                     "customer_id": {"type": "string"}
-                }
+                },
+                "required": ["ticket_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_snowflake_tables",
+            "description": "List all available tables in the Snowflake data warehouse. Use this to discover what data is available.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "preview_snowflake_table",
+            "description": "Preview the first few rows of a specific Snowflake table to understand its structure.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "table_name": {"type": "string", "description": "The name of the table to preview."},
+                    "limit": {"type": "integer", "description": "Number of rows to preview (default 5)."}
+                },
+                "required": ["table_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_snowflake",
+            "description": "Execute a raw SQL query on Snowflake. Use this only if you know the table structure.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string", "description": "The SQL query to execute."}
+                },
+                "required": ["sql"]
             }
         }
     },
@@ -197,76 +252,23 @@ TOOLS = [
 
 # ── System prompt ──────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are Aria — a real, warm, and caring customer service person. You are NOT a bot and you should never sound like one. You speak the way a friendly, competent human would on a phone call: naturally, with genuine empathy, and always calm. You use short sentences. You breathe between thoughts. You care.
+SYSTEM_PROMPT = """
+You are Aria, a warm and empathetic voice-first customer service assistant. Our primary system of record is the Snowflake Data Warehouse.
 
-You naturally say things like:
-- "Of course!" / "Absolutely!" / "Sure thing!" / "Oh no, let me sort that out for you."
-- "Let me just pull that up..." / "Give me one second..." / "Right, I'm on it."
-- "That's totally understandable." / "I completely get that, I'm really sorry."
-- "Great news!" / "Perfect!" / "All sorted!"
+### CRITICAL: AUTHENTICATION FIRST
+1. **Greeting**: "Hey there! This is Aria. Before we get started, could I just grab your customer number (like CUST-1)?"
+2. **Wait for ID**: Do NOT call any other tool or acknowledge any problem until `authenticate_user` succeeds.
+3. **Post-Auth**: "Got it, thanks [Name]! Now, how can I help you today?" (If they mentioned an issue earlier, acknowledge it now with empathy).
 
-## YOUR RULES
-1. **Authenticate first.** Call `authenticate_user` as soon as the customer gives their number. Don't do anything else until authentication succeeds.
-2. **Let them lead.** After greeting, ask "How can I help you today?" and listen. Don't assume.
-3. **Ask one thing at a time.** Only ask for what you're missing. Never ask for info you already have.
-4. **Trust the tool results.** They calculate everything — expiry, ETAs, resolution type. Just read and relay them.
-5. **Keep it short and human.** 1–2 spoken sentences max. No lists, no tables, no raw IDs, no field names. Pretend you're on a call.
-6. **Match their language.** English by default. If they use Hindi, switch to Hindi naturally.
-7. **Never mention your tools.** Don't say "check_expiry" or "authenticate_user" or any function name. The customer can't see that.
-8. **Confirm before you act.** For refunds and exchanges: explain what you found, then ask "Shall I go ahead?" — and WAIT. Only run the action after a clear yes.
-9. **Never make up data.** If you don't have an order ID, ticket ID, or anything else — ask. Don't invent.
+### YOUR CORE FLOW (After Auth):
+- **Lookup**: If they ask about an order or report a problem, ask for the order number (e.g., ORD-1). Use `get_recent_orders` if they need help finding it.
+- **Details**: Use `get_order_details` to fetch order details. Acknowledge the order first and ask what they want to know before revealing details.
+- **Action**: Call `initiate_refund` or `initiate_exchange` only if confirmed by the user AND valid per our records.
 
----
-
-## HOW TO HANDLE EACH SITUATION
-
-### Starting the call
-Say: *"Hi there! This is Aria — thanks for getting in touch. Could I just grab your customer number to get started?"*
-- Map the number to CUST-00X format: 'one'→CUST-001, 'two'→CUST-002, 'three'→CUST-003, 'four'→CUST-004, 'five'→CUST-005
-- If auth fails: *"Hmm, I couldn't find anything with that number — could you try once more?"*
-- If auth succeeds: *"Lovely, hi [first name]! What can I do for you today?"*
-
-### Support / Ticket (issue, problem, outage, ticket)
-Say: *"Oh I'm sorry to hear that — let me help. Have you raised a ticket for this before, or is it a new issue?"*
-
-**Have a ticket:**
-- *"Sure, what's the ticket number?"*
-- Call `check_ticket_status`. Normalization: "one" → "TICK-1001"
-- Reply with status + ETA in one warm sentence.
-- If they're upset: *"I completely understand — let me escalate this right now."*
-
-**New issue:**
-- *"Of course, I'll get that logged. Could you just describe what's happening?"*
-- Call `raise_support_ticket`.
-- *"Done! I've raised a ticket for you — our team will be in touch very soon."*
-
-### Expired / Damaged product (order, product, delivery, damaged, expired)
-Say: *"Oh no, I'm so sorry about that! What's your order number and I'll take a look right away?"*
-- WAIT for the number. Never guess it.
-- Call `check_expiry` using the order number the customer gave and their customer_id from authentication.
-  - Normalise: "one zero zero one" → ORD-1001
-- The post-tool system message will tell you exactly what to say next. Follow it precisely.
-- Never call `initiate_refund` or `initiate_exchange` until the customer says yes.
-- After confirmation: *"Perfect — all sorted! You'll get a confirmation very soon."*
-
-### Anything else
-Say: *"Oh, I'm set up just for product returns and support tickets right now — I'm sorry I can't help with that directly. Want me to get someone from the team to reach out?"*
-
----
-
-## WORDS ARIA NEVER USES
-- Never say: "null", "undefined", "API", raw field names, order/ticket IDs out loud, "Please provide your..."
-- Never say: "I found X records", "The tool returned...", "check_expiry", "authenticate_user"
-- Never sound stiff, formal or robotic. Never say "I am processing your request."
-
-## ARIA'S VOICE — EXAMPLES
-| Stiff (bad) | Natural (good) |
-|---|---|
-| "Please provide your customer ID." | "Could I just grab your customer number?" |
-| "Authentication was successful." | "Great — hi [name], lovely to meet you!" |
-| "I have initiated a refund." | "All sorted! Your refund's on its way." |
-| "Your ticket has high priority." | "Good news — it's been flagged as high priority, so the team should have it sorted within 3 days." |
-| "I'm sorry, I cannot assist with that." | "Oh, I'm afraid that's a bit outside what I can do — but let me point you to the right person!" |
+### GUIDELINES:
+- **Strict Sequence**: Authenticate -> Identification -> Resolution.
+- **No Jargon**: Never say "Snowflake", "API", or "Database". Say "our records".
+- **Concise**: Responses under 25 words for voice. Natural fillers like "Hmm", "Ah".
 """
 
 # ── Session storage ────────────────────────────────────────────────────────────
@@ -288,9 +290,10 @@ class TTSRequest(BaseModel):
 
 # All known tool names (reduced scope)
 _TOOL_NAMES = {
-    "authenticate_user", "check_expiry", "initiate_refund",
+    "authenticate_user", "get_order_details", "initiate_refund",
     "initiate_exchange", "check_ticket_status",
-    "raise_support_ticket", "escalate_ticket"
+    "raise_support_ticket", "escalate_ticket",
+    "list_snowflake_tables", "preview_snowflake_table", "query_snowflake"
 }
 
 def _sanitize_response(text: str) -> str:
@@ -359,47 +362,67 @@ def _call_llm(messages: list, tools: Optional[list] = None,
 
 async def _execute_tool(function_name: str, function_args: dict) -> dict:
     """Route a tool call to the corresponding UnifiedConnector method (async)."""
-    # Normalise IDs (LLM sometimes says 'ORDER-1001' or 'SALES-1001' instead of 'ORD-1001')
     import re
-    if "order_id" in function_args:
-        oid = str(function_args["order_id"]).upper()
-        # Match digits
-        match = re.search(r'(\d+)', oid)
-        if match:
-            # Reformat to ORD-XXXX (always use ORD prefix)
-            function_args["order_id"] = f"ORD-{match.group(1)}"
+    if not isinstance(function_args, dict):
+        function_args = {}
+
+
+    def _normalise(s: str) -> str:
+        words = str(s).lower().split()
+        return " ".join(_WORD_NUM.get(w, w) for w in words)
+
     if "customer_id" in function_args:
-        cid = str(function_args["customer_id"]).upper()
+        cid = _normalise(function_args["customer_id"])
         match = re.search(r'(\d+)', cid)
         if match:
-            # Reformat to CUST-XXX (padded to 3 digits)
             function_args["customer_id"] = f"CUST-{int(match.group(1)):03d}"
+    if "order_id" in function_args:
+        oid = _normalise(function_args["order_id"])
+        match = re.search(r'(\d+)', oid)
+        if match:
+            function_args["order_id"] = f"ORD-{match.group(1)}"
     if "ticket_id" in function_args:
-        tid = str(function_args["ticket_id"]).upper()
+        tid = _normalise(function_args["ticket_id"])
         match = re.search(r'(\d+)', tid)
         if match:
             function_args["ticket_id"] = f"TICK-{match.group(1)}"
 
-    uc = UnifiedConnector()
+
+    cache_key = make_cache_key(function_name, **function_args)
+    cached_result = data_cache.get(cache_key)
+    if cached_result:
+        print(f"[LLM ROUTER] Cache HIT for tool: {function_name}")
+        return cached_result
+
+    print(f"[LLM ROUTER] Cache MISS for tool: {function_name}")
+    uc = unified_connector
     dispatch = {
-        # CRM
+        # Snowflake-Native CRM/E-commerce
         "authenticate_user":       uc.authenticate_user,
-        "check_expiry":            uc.get_order_details,
+        "get_recent_orders":       uc.get_customer_orders,
+        "get_order_details":        uc.get_order_details,
         "initiate_refund":         uc.initiate_refund,
         "initiate_exchange":       uc.initiate_exchange,
-        # Support
-        "check_ticket_status":     uc.check_ticket_status,
-        "raise_support_ticket":    uc.raise_support_ticket,
-        "escalate_ticket":         uc.escalate_ticket,
+        # Snowflake Metadata/Query
+        "list_snowflake_tables":   uc.list_snowflake_tables,
+        "preview_snowflake_table": uc.preview_snowflake_table,
+        "query_snowflake":         uc.query_snowflake,
     }
     fn = dispatch.get(function_name)
     if fn is None:
         return {"success": False, "data": {}, "message": f"Unknown tool: {function_name}"}
     try:
-        return await fn(**function_args)
+        print(f"[DEBUG] Calling {function_name} with args: {function_args}")
+        result = await fn(**function_args)
+        print(f"[DEBUG] {function_name} result: {result}")
+        if result.get("success"):
+            data_cache.set(cache_key, result)
+        return result
     except ConfigurationError as ce:
+        print(f"[DEBUG] ConfigurationError: {ce}")
         return {"success": False, "data": {}, "message": str(ce)}
     except TypeError as te:
+        print(f"[DEBUG] TypeError: {te}")
         return {"success": False, "data": {}, "message": f"Tool call error: {te}"}
 
 # ── TTS endpoint ───────────────────────────────────────────────────────────────
@@ -409,10 +432,14 @@ async def text_to_speech(request: TTSRequest):
     """Generate audio from text using edge-tts and return as a stream."""
     print(f"TTS Request: {request.text[:60]}...")
     try:
+        import re as _re
         clean_text = request.text.replace("_", " ")
+        # Strip parenthetical stage directions e.g. (pause), (Pause), (laughs)
+        clean_text = _re.sub(r'\(\s*\w[\w\s]*\)', '', clean_text)
+        clean_text = _re.sub(r'\s{2,}', ' ', clean_text).strip()
         is_hindi = any("\u0900" <= c <= "\u097F" for c in clean_text)
-        voice = "hi-IN-SwaraNeural" if is_hindi else "en-US-JennyNeural"
-        communicate = edge_tts.Communicate(clean_text, voice, rate="+15%")
+        voice = "hi-IN-SwaraNeural" if is_hindi else "en-US-MichelleNeural"
+        communicate = edge_tts.Communicate(clean_text, voice, rate="-5%")
         audio_stream = io.BytesIO()
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
@@ -427,8 +454,165 @@ async def text_to_speech(request: TTSRequest):
 
 @router.post("/", response_model=Dict[str, Any])
 async def chat_with_data(request: ChatRequest):
+    session_id = request.session_id
+    if session_id not in SESSIONS:
+        SESSIONS[session_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    history = SESSIONS[session_id]
+
     async def _stream_response():
         try:
+            import re as _re
+            nonlocal history
+
+            def _extract_customer_id(msg: str) -> Optional[str]:
+                """Return normalised CUST-XXX if message looks like a customer number, else None."""
+                tokens = msg.lower().strip().split()
+                normalised = " ".join(_WORD_NUM.get(t, t) for t in tokens)
+                # Match an explicit CUST-NNN pattern
+                m = _re.search(r'cust[-\s]?(\d+)', normalised, _re.IGNORECASE)
+                if m:
+                    return f"CUST-{int(m.group(1)):03d}"
+                # Match a bare number (digits or single word-number)
+                m = _re.fullmatch(r'\s*(\d+)\s*', normalised)
+                if m:
+                    return f"CUST-{int(m.group(1)):03d}"
+                # Single recognised word-number alone
+                if len(tokens) == 1 and tokens[0] in _WORD_NUM:
+                    return f"CUST-{int(_WORD_NUM[tokens[0]]):03d}"
+                return None
+
+            def _get_authenticated_id(hist: list) -> Optional[str]:
+                """Return the CUST-XXX string if already authenticated."""
+                for m in hist:
+                    # Robust check for role: handles both dicts and Pydantic models (though history should be dicts now)
+                    role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
+                    if role == "tool":
+                        try:
+                            import json as _json
+                            content = m.get("content", "{}") if isinstance(m, dict) else getattr(m, "content", "{}")
+                            data = _json.loads(content)
+                            if data.get("success") and data.get("data", {}).get("customer_id"):
+                                return data["data"]["customer_id"]
+                        except Exception:
+                            pass
+                return None
+
+            # ── Parallel Metadata & Pre-Auth Logic ───────────────────────────────
+            # Define SQL/Metadata intent keywords to keep context retrieval lazy
+            METADATA_KEYWORDS = {"sql", "table", "schema", "data", "database", "query", "record", "list", "show", "preview"}
+            has_metadata_intent = any(kw in request.message.lower() for kw in METADATA_KEYWORDS)
+            
+            async def _get_metadata():
+                if has_metadata_intent:
+                    return await metadata_service.get_context_for_query(request.message)
+                return None
+
+            # Run metadata retrieval and pre-auth check in parallel
+            context_task = asyncio.create_task(_get_metadata())
+            
+            candidate_id = _extract_customer_id(request.message)
+            existing_id = _get_authenticated_id(history)
+
+            # If metadata is retrieved, append it to history
+            context = await context_task
+            if context:
+                history.append({
+                    "role": "system",
+                    "content": f"SYSTEM CONTEXT (Snowflake Datalake):\n{context}\nUse this exact schema when generating SQL queries or discussing our data."
+                })
+
+            # If user provides a DIFFERENT ID, force reset to avoid identity mixing
+            if candidate_id and existing_id and candidate_id != existing_id:
+                print(f"[SESSION] Identity switch detected: {existing_id} -> {candidate_id}. Resetting.")
+                history = [{"role": "system", "content": SYSTEM_PROMPT}]
+                SESSIONS[session_id] = history
+                existing_id = None
+
+            if candidate_id and not existing_id:
+                print(f"[PRE-AUTH] Detected customer number: {candidate_id}")
+                auth_result = await _execute_tool("authenticate_user", {"customer_id": candidate_id})
+                print(f"[PRE-AUTH] Auth result: {auth_result}")
+
+                if auth_result.get("success"):
+                    # Inject a synthetic tool exchange into history
+                    import json as _json, uuid as _uuid
+                    tool_call_id = f"preauth_{_uuid.uuid4().hex[:8]}"
+                    # Synthetic assistant message that "called" the tool
+                    history.append({
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": tool_call_id,
+                            "type": "function",
+                            "function": {
+                                "name": "authenticate_user",
+                                "arguments": _json.dumps({"customer_id": candidate_id})
+                            }
+                        }]
+                    })
+                    history.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": _json.dumps(auth_result, default=str),
+                    })
+                    # Snowflake TPC-H names are 'Customer#000000087' — make them more human
+                    raw_name = auth_result.get("data", {}).get("name", "")
+                    if raw_name and "Customer#" in raw_name:
+                        c_match = re.search(r'#0*(\d+)', raw_name)
+                        first_name = f"Customer {c_match.group(1)}" if c_match else raw_name
+                    else:
+                        first_name = raw_name.split()[0] if raw_name else "there"
+
+                    history.append({
+                        "role": "system",
+                        "content": (
+                            f"Authentication successful. The customer's name is '{first_name}'. "
+                            f"IMPORTANT: Use the name '{first_name}' in your very next reply. "
+                            f"Greet them warmly, e.g. 'Got it, thanks {first_name}! I can see your profile details on my screen. How can I help you today?' "
+                            f"Do NOT invent a different name."
+                        ),
+                    })
+                    history.append({
+                        "role": "system",
+                        "content": (
+                            "REMINDER: Your next reply must be a natural spoken sentence. "
+                            "Do NOT mention function names, JSON, or tool parameters. "
+                            "Speak as if you are a human on a phone call."
+                        ),
+                    })
+                    # Stream the greeting response
+                    def _greeting_stream():
+                        return client.chat.completions.create(
+                            model=MODEL_NAME,
+                            messages=history,
+                            max_tokens=100,
+                            stream=True,
+                            temperature=0.0,
+                        )
+                    stream = await loop.run_in_executor(None, _greeting_stream)
+                    full_response_content = ""
+                    for chunk in stream:
+                        content = chunk.choices[0].delta.content
+                        if content:
+                            full_response_content += content
+                            yield f"data: {json.dumps({'text': content})}\n\n"
+                    response_text = _sanitize_response(full_response_content or f"Hi {first_name}! How can I help you today?")
+                    history.append({"role": "assistant", "content": response_text})
+                    yield f"data: {json.dumps({'done': True, 'data': [auth_result.get('data', {})]})}\n\n"
+                    return
+                else:
+                    # Auth failed — tell the LLM what happened and let it respond naturally
+                    import json as _json
+                    history.append({
+                        "role": "system",
+                        "content": (
+                            f"Authentication failed: {auth_result.get('message', 'No account found.')} "
+                            "Apologise naturally and ask the customer to try their number again."
+                        ),
+                    })
+                    # Fall through to the normal LLM call below
+
             # ── First LLM call — offloaded to thread pool (Groq SDK is sync) ─────
             response = await loop.run_in_executor(
                 None,
@@ -438,18 +622,21 @@ async def chat_with_data(request: ChatRequest):
 
             # ── If the LLM wants to call a tool ─────────────────────────────────
             if message.tool_calls:
-                history.append(message)
+                # Convert the ChatCompletionMessage object to a dict to avoid AttributeError
+                # when iterating history (Pydantic models don't have .get())
+                history.append(message.model_dump(exclude_none=True))
 
-                # Execute ALL tool calls
-                tool_results = []
+                # Execute ALL tool calls in PARALLEL
+                tool_tasks = []
                 for tool_call in message.tool_calls:
                     fn_name = tool_call.function.name
                     fn_args = json.loads(tool_call.function.arguments or "{}")
                     print(f"Tool called: {fn_name}({fn_args})")
+                    tool_tasks.append(_execute_tool(fn_name, fn_args))
+                
+                tool_results = await asyncio.gather(*tool_tasks)
 
-                    tool_result = await _execute_tool(fn_name, fn_args)
-                    tool_results.append(tool_result)
-
+                for tool_call, tool_result in zip(message.tool_calls, tool_results):
                     history.append({
                         "role":         "tool",
                         "tool_call_id":  tool_call.id,
@@ -462,52 +649,87 @@ async def chat_with_data(request: ChatRequest):
 
                     # After successful auth: force a clean greeting, not tool narration
                     if fn_name == "authenticate_user" and tool_result.get("success"):
-                        customer_name = tool_result.get("data", {}).get("name", "")
-                        first_name = customer_name.split()[0] if customer_name else "there"
+                        raw_customer_name = tool_result.get("data", {}).get("name", "")
+                        if raw_customer_name and "Customer#" in raw_customer_name:
+                            c_match = re.search(r'#0*(\d+)', raw_customer_name)
+                            first_name = f"Customer {c_match.group(1)}" if c_match else raw_customer_name
+                        else:
+                            first_name = raw_customer_name.split()[0] if raw_customer_name else "there"
                         history.append({
                             "role": "system",
                             "content": (
-                                f"Authentication succeeded. The customer's name is {first_name}. "
-                                f"Greet them by first name warmly and ask 'How can I help you today?' "
-                                f"Do NOT say 'authenticating' or any function name. Just greet naturally."
+                                f"Authentication succeeded. The customer's name is '{first_name}'. "
+                                f"Greet them warmly and mention that their profile details are now visible. "
+                                f"Ask 'How can I help you today?' Do NOT say any function name. Just greet naturally."
                             ),
                         })
 
-                    # After check_expiry: explain result and STOP — do NOT call initiate_refund/exchange yet
-                    if fn_name == "check_expiry":
+                     # After get_order_details: explain result and STOP
+                    if fn_name == "get_order_details":
                         data = tool_result.get("data", {})
                         products = data if isinstance(data, list) else [data]
-                        p = products[0] if products else {}
-                        product_name = p.get("product_name") or p.get("name", "the product")
-                        category     = p.get("category", "")
-                        expired      = p.get("expired", False)
-                        resolution   = p.get("recommended_resolution", "refund")
+                        
+                        num_items = len(products)
+                        if num_items == 1:
+                            p = products[0]
+                            product_summary = f"'{p.get('product_name')}'"
+                            expired = p.get("expired", False)
+                            resolution = p.get("recommended_resolution", "refund")
+                        else:
+                            names = [p.get("product_name") for p in products]
+                            product_summary = f"{num_items} items (" + ", ".join([f"'{n}'" for n in names]) + ")"
+                            expired = any(p.get("expired") for p in products)
+                            resolution = products[0].get("recommended_resolution", "refund")
 
-                        if expired:
-                            if resolution == "exchange":
-                                instruction = (
-                                    f"The tool confirmed that '{product_name}' (category: {category}) HAS expired. "
-                                    f"The recommended resolution is an EXCHANGE (replacement unit). "
-                                    f"Tell the customer what you found in 1 warm sentence and ask: "
-                                    f"'Shall I go ahead and arrange a replacement for you?' "
-                                    f"STOP HERE. Do NOT call initiate_exchange or initiate_refund yet. "
-                                    f"Wait for the customer to say yes or no."
-                                )
+                        # Nuanced Intent Detection: Generic vs Specific
+                        msg_lower = request.message.lower()
+                        specific_problem_keywords = [
+                            "refund", "return", "exchange", "broken", "wrong", 
+                            "expired", "damaged", "defective", "stolen", "lost", "faulty"
+                        ]
+                        # User wants specific info
+                        info_request_keywords = ["ship", "date", "status", "price", "amount", "tax", "discount", "where", "delivered", "receive"]
+                        
+                        has_problem = any(kw in msg_lower for kw in specific_problem_keywords)
+                        has_info_request = any(kw in msg_lower for kw in info_request_keywords)
+                        asked_about_expiry = "expire" in msg_lower or "old" in msg_lower
+
+                        if not (has_problem or has_info_request or asked_about_expiry):
+                            # User just provided ID, hasn't asked for anything yet
+                            instruction = (
+                                f"I have found order details for {product_summary}. "
+                                f"CRITICAL: Do NOT show ANY details yet (no dates, no prices, no expiration). "
+                                f"Acknowledge the order and ask: "
+                                f"'I've found your order for {product_summary if num_items == 1 else str(num_items) + ' items'}. "
+                                f"What specific information would you like to know about it? "
+                                f"I can check on the status, shipping dates, pricing, or any other details.'"
+                            )
+                        elif has_info_request and not (has_problem or asked_about_expiry):
+                            # User asked for specific info (e.g., "when was it shipped?")
+                            instruction = (
+                                f"The user wants to know specific info: '{request.message}'. "
+                                f"Provide ONLY the information they asked for based on the tool results. "
+                                f"Do NOT mention expiration, refunds, or other unrelated details unless they specifically asked."
+                            )
+                        elif has_problem or asked_about_expiry:
+                            # User has a problem or asked about expiration
+                            if expired:
+                                if resolution == "reject":
+                                    instruction = (
+                                        f"The user has a problem/query and the item is older than 90 days. "
+                                        f"Politely explain that it is outside the return window. "
+                                        f"Do NOT offer a refund or exchange."
+                                    )
+                                else:
+                                    instruction = (
+                                        f"The user has a problem/query and the item is old (expired). "
+                                        f"Suggest a {resolution} as the policy allows."
+                                    )
                             else:
                                 instruction = (
-                                    f"The tool confirmed that '{product_name}' (category: {category}) HAS expired. "
-                                    f"The recommended resolution is a REFUND. "
-                                    f"Tell the customer what you found in 1 warm sentence and ask: "
-                                    f"'Shall I go ahead and arrange a full refund for you?' "
-                                    f"STOP HERE. Do NOT call initiate_refund yet. "
-                                    f"Wait for the customer to say yes or no."
+                                    f"The user has a problem but the items are within the valid return window. "
+                                    f"Help them with their specific issue."
                                 )
-                        else:
-                            instruction = (
-                                f"The tool confirmed that '{product_name}' has NOT expired. "
-                                f"Tell the customer the good news in 1 warm sentence and ask if there is "
-                                f"anything else you can help with. DO NOT offer a refund or exchange."
-                            )
 
                         history.append({"role": "system", "content": instruction})
 
@@ -553,7 +775,19 @@ async def chat_with_data(request: ChatRequest):
                         all_data.append(d)
 
                 # Send finalize event with all data cards
-                yield f"data: {json.dumps({'done': True, 'data': all_data})}\n\n"
+                def _json_serial(obj):
+                    """JSON serializer for objects not serializable by default json code"""
+                    if isinstance(obj, (_dt.datetime, _dt.date)):
+                        return obj.isoformat()
+                    from decimal import Decimal
+                    if isinstance(obj, Decimal):
+                        return float(obj)
+                    if isinstance(obj, set):
+                        return list(obj)
+                    return str(obj)
+
+                import datetime as _dt
+                yield f"data: {json.dumps({'done': True, 'data': all_data}, default=_json_serial)}\n\n"
 
             else:
                 # ── No tool call — plain conversational reply — Streaming ───────────
@@ -580,8 +814,10 @@ async def chat_with_data(request: ChatRequest):
                 yield f"data: {json.dumps({'done': True, 'data': []})}\n\n"
 
         except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            print(f"LLM Error Traceback:\n{tb}")
             error_str = str(e)
-            print(f"LLM Error: {error_str}")
 
             if "429" in error_str or "rate" in error_str.lower():
                 msg = "I'm receiving too many requests right now. Could you try again in a moment?"
@@ -590,7 +826,7 @@ async def chat_with_data(request: ChatRequest):
             elif "503" in error_str or "unavailable" in error_str.lower():
                 msg = "The AI service is briefly unavailable. Please try again shortly."
             else:
-                msg = "I'm having a little trouble right now. Could you please try again?"
+                msg = f"I'm having a little trouble: {tb[-300:]}"
 
             yield f"data: {json.dumps({'text': msg, 'done': True, 'data': []})}\n\n"
 
@@ -600,12 +836,23 @@ async def chat_with_data(request: ChatRequest):
     import asyncio
     loop = asyncio.get_event_loop()
 
-    session_id = request.session_id
-    if session_id not in SESSIONS:
-        SESSIONS[session_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    # --- Session Reset / Truncation Logic ---
+    clean_msg = request.message.lower().strip().replace("!", "").replace(".", "")
+    is_greeting = clean_msg in ["hello", "hi", "hey", "start over", "restart"]
+    
+    # If it's a fresh greeting and we aren't halfway through a multi-turn tool call, reset
+    if is_greeting and len(history) > 1:
+        print(f"[SESSION] Resetting session {session_id} due to fresh greeting.")
+        history = [{"role": "system", "content": SYSTEM_PROMPT}]
+        SESSIONS[session_id] = history
 
-    history = SESSIONS[session_id]
     history.append({"role": "user", "content": request.message})
+    
+    # Limit history to prevent context bloat (last 15 turns)
+    if len(history) > 30: # 15 user + 15 assistant messages
+         # Keep system prompt at [0]
+         SESSIONS[session_id] = [history[0]] + history[-20:]
+         history = SESSIONS[session_id]
     return StreamingResponse(
         _stream_response(),
         media_type="text/event-stream"

@@ -11,4 +11,10 @@ openai
 openpyxl
 slowapi
 httpx
-openai
+snowflake-connector-python
+groq
+tenacity
+edge-tts
+pydantic-settings
+numpy
+redis

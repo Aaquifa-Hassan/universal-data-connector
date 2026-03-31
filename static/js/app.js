@@ -62,14 +62,6 @@ if (SpeechRecognition) {
         }
     };
 
-    recognition.onsoundstart = () => {
-        logDebug("Sound Start Detected");
-        // Most sensitive immediate Barge-in: fires as soon as ANY sound starts.
-        if (isCallActive && isAISpeaking) {
-            logDebug("Barge-in: Interruption triggered (Sound Start)", "success");
-            interruptAI();
-        }
-    };
 
     recognition.onspeechstart = () => {
         logDebug("Speech Start Detected");
@@ -84,6 +76,11 @@ if (SpeechRecognition) {
         if (!isAISpeaking) return;
 
         console.log("Interrupting AI synthesis...");
+        // Stop backend audio
+        if (currentAudio) {
+            currentAudio.pause();
+            currentAudio = null;
+        }
         window.speechSynthesis.cancel();
         isAISpeaking = false;
         micButton.classList.remove('speaking');
@@ -544,23 +541,72 @@ function scrollToBottom() {
     chatHistory.scrollTop = chatHistory.scrollHeight;
 }
 
-// ── Text-to-Speech ──
+// ── Text-to-Speech (via backend edge_tts) ──
+let currentAudio = null;
+
 function speak(text) {
-    if ('speechSynthesis' in window) {
-        window.speechSynthesis.cancel();
+    // Stop any currently playing audio
+    if (currentAudio) {
+        currentAudio.pause();
+        currentAudio = null;
+    }
+    window.speechSynthesis.cancel(); // stop browser TTS if any lingered
+
+    isAISpeaking = true;
+    logDebug("AI Started Speaking");
+
+    if (isCallActive) {
+        status.textContent = 'Call Active: AI Responding... (speak to interrupt)';
+        micButton.classList.add('speaking');
+    }
+
+    // Call backend TTS (edge_tts — SaraNeural soft voice)
+    fetch(`${API_BASE}/chat/tts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-API-Key': API_KEY },
+        body: JSON.stringify({ text })
+    })
+    .then(res => {
+        if (!res.ok) throw new Error(`TTS HTTP ${res.status}`);
+        return res.blob();
+    })
+    .then(blob => {
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        currentAudio = audio;
+
+        audio.onended = () => {
+            isAISpeaking = false;
+            currentAudio = null;
+            URL.revokeObjectURL(url);
+            if (isCallActive) {
+                micButton.classList.remove('speaking');
+                status.textContent = 'Call Active: Listening...';
+            }
+            logDebug("AI Finished Speaking");
+        };
+
+        audio.onerror = () => {
+            isAISpeaking = false;
+            currentAudio = null;
+            if (isCallActive) {
+                micButton.classList.remove('speaking');
+                status.textContent = 'Call Active: Listening...';
+            }
+        };
+
+        audio.play().catch(err => {
+            logDebug(`Audio play error: ${err}`, 'error');
+            isAISpeaking = false;
+        });
+    })
+    .catch(err => {
+        logDebug(`TTS backend error: ${err.message} — falling back to browser TTS`, 'error');
+        // Fallback to browser speech synthesis
         const utterance = new SpeechSynthesisUtterance(text);
-        utterance.rate = 0.9;
-        utterance.pitch = 1;
+        utterance.rate = 0.85;
+        utterance.pitch = 0.9;
         utterance.volume = 1;
-
-        isAISpeaking = true;
-        logDebug("AI Started Speaking");
-
-        if (isCallActive) {
-            status.textContent = 'Call Active: AI Responding... (speak to interrupt)';
-            micButton.classList.add('speaking');
-        }
-
         utterance.onend = () => {
             isAISpeaking = false;
             if (isCallActive) {
@@ -568,19 +614,20 @@ function speak(text) {
                 status.textContent = 'Call Active: Listening...';
             }
         };
-
-        utterance.onerror = (e) => {
-            console.error("Speech Synthesis Error", e);
-            isAISpeaking = false;
-            if (isCallActive) {
-                micButton.classList.remove('speaking');
-                status.textContent = 'Call Active: Listening...';
-            }
-        };
-
         window.speechSynthesis.speak(utterance);
-    }
+    });
 }
+
+// Expose interruptAI to stop backend audio too
+function stopAudio() {
+    if (currentAudio) {
+        currentAudio.pause();
+        currentAudio = null;
+    }
+    window.speechSynthesis.cancel();
+    isAISpeaking = false;
+}
+
 
 // ── Copy AI response to clipboard ──
 function copyResponse(bubble) {

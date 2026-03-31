@@ -248,3 +248,8 @@ docker-compose up --build
 ```
 
 Visit: http://localhost:8000/docs
+
+.venv/bin/python -m uvicorn mock_api_server.server:app --host 0.0.0.0 --port 8000 --reload
+
+
+.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 5000 --reload
